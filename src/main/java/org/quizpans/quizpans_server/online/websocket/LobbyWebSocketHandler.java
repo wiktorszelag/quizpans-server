@@ -13,10 +13,10 @@ import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.io.IOException;
 import java.lang.reflect.Type;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -33,6 +33,7 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, Long> recentlyJoinedWebPlayers = new ConcurrentHashMap<>();
 
+    @Autowired
     public LobbyWebSocketHandler(LobbyService lobbyService) {
         this.lobbyService = lobbyService;
     }
@@ -71,264 +72,173 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
                     lobbyId = (String) messageData.get("lobbyId");
                     if (lobbyId != null) {
                         updatedLobbyOpt = lobbyService.hostTakesLobby(lobbyId, session.getId());
-                        updatedLobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> sendError(session, "Nie udało się przejąć lobby: " + lobbyId)
-                        );
-                    } else {
-                        sendError(session, "Brak lobbyId w żądaniu requestHostLobby.");
-                    }
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się przejąć lobby: " + lobbyId));
+                    } else { sendError(session, "Brak lobbyId w żądaniu requestHostLobby."); }
                     break;
                 case "configureLobby":
                     lobbyId = (String) messageData.get("lobbyId");
                     Map<String, Object> settingsMap = (Map<String, Object>) messageData.get("gameSettings");
-                    GameSettings settings = null;
-                    if (settingsMap != null) {
-                        settings = gson.fromJson(gson.toJson(settingsMap), GameSettings.class);
-                    }
+                    GameSettings settings = (settingsMap != null) ? gson.fromJson(gson.toJson(settingsMap), GameSettings.class) : null;
                     String password = (String) messageData.get("password");
-
                     if (lobbyId != null && settings != null) {
                         updatedLobbyOpt = lobbyService.finalizeLobbyConfiguration(lobbyId, session.getId(), settings, password);
-                        updatedLobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> sendError(session, "Nie udało się skonfigurować lobby: " + lobbyId)
-                        );
-                    } else {
-                        sendError(session, "Brak lobbyId lub gameSettings w żądaniu configureLobby.");
-                    }
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się skonfigurować lobby: " + lobbyId));
+                    } else { sendError(session, "Brak lobbyId lub gameSettings w żądaniu configureLobby."); }
                     break;
-
                 case "playerWebJoinRequest":
                     lobbyId = (String) messageData.get("lobbyId");
                     String nickname = (String) messageData.get("nickname");
+                    String providedPassword = (String) messageData.get("password");
                     if (lobbyId != null && nickname != null) {
                         PlayerInfo webPlayer = new PlayerInfo(session.getId(), nickname, null);
-                        updatedLobbyOpt = lobbyService.addWaitingPlayer(lobbyId, webPlayer);
-                        updatedLobbyOpt.ifPresentOrElse(
-                                lobby -> {
-                                    recentlyJoinedWebPlayers.put(session.getId(), System.currentTimeMillis());
-                                    this.broadcastLobbyUpdate(lobby);
-                                },
-                                () -> sendError(session, "Nie udało się dołączyć do poczekalni lobby " + lobbyId)
-                        );
-                    } else {
-                        sendError(session, "Brak lobbyId lub nickname w żądaniu playerWebJoinRequest.");
-                    }
+                        updatedLobbyOpt = lobbyService.addWaitingPlayerWithPasswordCheck(lobbyId, webPlayer, providedPassword);
+                        final String finalLobbyId = lobbyId;
+                        updatedLobbyOpt.ifPresentOrElse(lobby -> {
+                            recentlyJoinedWebPlayers.put(session.getId(), System.currentTimeMillis());
+                            Map<String, Object> successMsg = Map.of("type", "joinSuccess", "lobbyId", lobby.getId());
+                            sendMessageToSession(session, successMsg);
+                            this.broadcastLobbyUpdate(lobby);
+                        }, () -> {
+                            Optional<Lobby> targetLobbyOpt = lobbyService.getLobby(finalLobbyId);
+                            if (targetLobbyOpt.isPresent()) {
+                                Lobby targetLobby = targetLobbyOpt.get();
+                                boolean isPasswordProtected = targetLobby.getPassword() != null && !targetLobby.getPassword().isEmpty();
+                                if (isPasswordProtected && providedPassword != null && !providedPassword.isEmpty()) {
+                                    sendError(session, "Błędne hasło do lobby '" + targetLobby.getName() + "'. Spróbuj ponownie.");
+                                } else if (isPasswordProtected && (providedPassword == null || providedPassword.isEmpty())) {
+                                    sendError(session, "Lobby '" + targetLobby.getName() + "' jest zabezpieczone hasłem. Musisz je podać.");
+                                } else {
+                                    sendError(session, "Nie udało się dołączyć do lobby '" + targetLobby.getName() + "'. Może być pełne lub niedostępne.");
+                                }
+                            } else {
+                                sendError(session, "Nie znaleziono lobby o ID: " + finalLobbyId);
+                            }
+                        });
+                    } else { sendError(session, "Brak lobbyId lub nickname w żądaniu playerWebJoinRequest."); }
                     break;
+                case "announceWebPlayerInRoom":
+                    lobbyId = (String) messageData.get("lobbyId");
+                    String playerNickname = (String) messageData.get("nickname");
+                    String newPlayerSessionId = (String) messageData.get("newSessionId");
 
+                    if (lobbyId != null && playerNickname != null && newPlayerSessionId != null && newPlayerSessionId.equals(session.getId())) {
+                        PlayerInfo announcedPlayer = new PlayerInfo(session.getId(), playerNickname, null);
+                        Optional<Lobby> lobbyOpt = lobbyService.getLobby(lobbyId);
+                        if (lobbyOpt.isPresent()) {
+                            Lobby currentLobby = lobbyOpt.get();
+                            if (currentLobby.findParticipantBySessionId(session.getId()) == null) {
+                                if (currentLobby.addWaitingPlayer(announcedPlayer)) {
+                                    this.broadcastLobbyUpdate(currentLobby);
+                                } else {
+                                    sendError(session, "Nie udało się dodać gracza " + playerNickname + " do poczekalni lobby " + lobbyId + " po przejściu.");
+                                }
+                            } else {
+                                this.broadcastLobbyUpdate(currentLobby);
+                            }
+                        } else {
+                            sendError(session, "Nie znaleziono lobby " + lobbyId + " przy próbie ogłoszenia gracza.");
+                        }
+                    } else { sendError(session, "Brakujące lub nieprawidłowe dane w żądaniu announceWebPlayerInRoom."); }
+                    break;
                 case "assignRole":
                     lobbyId = (String) messageData.get("lobbyId");
                     String participantSessionId = (String) messageData.get("participantSessionId");
                     String role = (String) messageData.get("role");
                     String targetTeamName = (String) messageData.get("targetTeamName");
-
                     if (lobbyId != null && participantSessionId != null && role != null) {
                         updatedLobbyOpt = lobbyService.assignParticipantRole(lobbyId, session.getId(), participantSessionId, role, targetTeamName);
-                        updatedLobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> sendError(session, "Nie udało się przypisać roli uczestnikowi " + participantSessionId + " w lobby " + lobbyId)
-                        );
-                    } else {
-                        sendError(session, "Brakujące dane w żądaniu assignRole (lobbyId, participantSessionId, role).");
-                    }
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się przypisać roli."));
+                    } else { sendError(session, "Brakujące dane w żądaniu assignRole."); }
                     break;
-
                 case "unassignParticipant":
                     lobbyId = (String) messageData.get("lobbyId");
                     String participantToUnassignSessionId = (String) messageData.get("participantSessionId");
                     if (lobbyId != null && participantToUnassignSessionId != null) {
                         updatedLobbyOpt = lobbyService.unassignParticipant(lobbyId, session.getId(), participantToUnassignSessionId);
-                        updatedLobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> sendError(session, "Nie udało się przenieść uczestnika " + participantToUnassignSessionId + " do poczekalni w lobby " + lobbyId + ".")
-                        );
-                    } else {
-                        sendError(session, "Brakujące lobbyId lub participantSessionId w żądaniu unassignParticipant.");
-                    }
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się cofnąć uczestnika."));
+                    } else { sendError(session, "Brakujące dane w żądaniu unassignParticipant."); }
                     break;
-
                 case "leaveLobby":
                     lobbyId = (String) messageData.get("lobbyId");
                     if (lobbyId != null) {
-                        Optional<Lobby> lobbyOpt = lobbyService.removePlayerFromLobby(lobbyId, session.getId());
-                        lobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> System.err.println("WebSocket: Próba opuszczenia nieistniejącego lub nieudanego opuszczenia lobby " + lobbyId + " przez " + session.getId())
-                        );
-                    } else {
-                        sendError(session, "Brak lobbyId w żądaniu leaveLobby.");
-                    }
+                        lobbyService.removePlayerFromLobby(lobbyId, session.getId()).ifPresent(this::broadcastLobbyUpdate);
+                    } else { sendError(session, "Brak lobbyId w żądaniu leaveLobby."); }
                     break;
-
                 case "removeParticipantFromLobby":
                     lobbyId = (String) messageData.get("lobbyId");
                     String participantToRemoveSessionId = (String) messageData.get("participantSessionId");
                     if (lobbyId != null && participantToRemoveSessionId != null) {
                         updatedLobbyOpt = lobbyService.hostRemovesParticipant(lobbyId, session.getId(), participantToRemoveSessionId);
-                        updatedLobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> sendError(session, "Nie udało się usunąć uczestnika " + participantToRemoveSessionId + " z lobby " + lobbyId + " (być może nie jesteś hostem lub uczestnik nie istnieje).")
-                        );
-                    } else {
-                        sendError(session, "Brakujące lobbyId lub participantSessionId w żądaniu removeParticipantFromLobby.");
-                    }
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się usunąć uczestnika."));
+                    } else { sendError(session, "Brakujące dane w żądaniu removeParticipantFromLobby."); }
                     break;
-
                 case "startGame":
                     lobbyId = (String) messageData.get("lobbyId");
-                    if(lobbyId != null) {
+                    if (lobbyId != null) {
                         updatedLobbyOpt = lobbyService.setLobbyGameStatus(lobbyId, session.getId(), true);
-                        updatedLobbyOpt.ifPresentOrElse(
-                                this::broadcastLobbyUpdate,
-                                () -> sendError(session, "Nie udało się wystartować gry w lobby " + lobbyId)
-                        );
-                    } else {
-                        sendError(session, "Brak lobbyId w żądaniu startGame.");
-                    }
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się wystartować gry."));
+                    } else { sendError(session, "Brak lobbyId w żądaniu startGame."); }
                     break;
-                default:
-                    sendError(session, "Nieznana akcja: " + action);
+                case "submitAnswer":
+                    lobbyId = (String) messageData.get("lobbyId");
+                    String answer = (String) messageData.get("answer");
+                    String answeringPlayerSessionId = (String) messageData.get("playerSessionId");
+                    if (lobbyId != null && answer != null && answeringPlayerSessionId != null && answeringPlayerSessionId.equals(session.getId())) {
+                        updatedLobbyOpt = lobbyService.processPlayerAnswer(lobbyId, answeringPlayerSessionId, answer);
+                        updatedLobbyOpt.ifPresentOrElse(this::broadcastLobbyUpdate, () -> sendError(session, "Nie udało się przetworzyć odpowiedzi."));
+                    } else { sendError(session, "Brakujące dane lub niezgodność sesji w submitAnswer."); }
+                    break;
+                default: sendError(session, "Nieznana akcja: " + action);
             }
-
-        } catch (JsonSyntaxException e) {
-            sendError(session, "Błąd formatu wiadomości JSON.");
-        } catch (Exception e) {
-            sendError(session, "Wystąpił błąd serwera podczas przetwarzania wiadomości.");
-            e.printStackTrace();
-        }
+        } catch (JsonSyntaxException e) { sendError(session, "Błąd formatu JSON."); }
+        catch (Exception e) { sendError(session, "Błąd serwera."); e.printStackTrace(); }
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         String sessionId = session.getId();
         sessions.remove(sessionId);
-        System.out.println("WebSocket: Zamknięto połączenie: " + sessionId + ", status: " + status);
+        recentlyJoinedWebPlayers.remove(sessionId);
 
-        Long joinTimestamp = recentlyJoinedWebPlayers.remove(sessionId);
-        boolean wasRecentlyJoinedWebPlayer = joinTimestamp != null && (System.currentTimeMillis() - joinTimestamp < 5000);
-
-        if (wasRecentlyJoinedWebPlayer) {
-            System.out.println("WebSocket: Sesja " + sessionId + " była niedawno dołączonym graczem webowym. Opóźnianie usunięcia z lobby.");
-            return;
-        }
-
-        boolean broadcastAllNeeded = false;
-        List<Lobby> processedLobbies = new ArrayList<>();
-
-
-        for (Lobby lobby : lobbyService.getAllLobbies()) {
-            boolean wasHost = lobby.getHostSessionId() != null && lobby.getHostSessionId().equals(sessionId);
-
-            if (wasHost) {
-                System.out.println("WebSocket: Sesja " + sessionId + " była HOSTem w lobby " + lobby.getId() + ". Resetowanie lobby i informowanie graczy.");
-                processedLobbies.add(lobby);
-
-                List<String> playerSessionIdsInLobby = new ArrayList<>();
-                lobby.getWaitingPlayers().forEach(p -> playerSessionIdsInLobby.add(p.sessionId()));
-                lobby.getPlayersInTeams().forEach(p -> playerSessionIdsInLobby.add(p.sessionId()));
-                if (lobby.getQuizMaster() != null && !lobby.getQuizMaster().sessionId().equals(sessionId)) {
-                    playerSessionIdsInLobby.add(lobby.getQuizMaster().sessionId());
+        lobbyService.getAllLobbies().forEach(lobby -> {
+            if (sessionId.equals(lobby.getHostSessionId())) {
+                Optional<Lobby> resetOpt = lobbyService.resetLobbyDueToHostDisconnect(lobby.getId());
+                if(resetOpt.isPresent()){
+                    broadcastLobbyUpdate(resetOpt.get());
                 }
-
-                for (String playerSessionIdInLobby : playerSessionIdsInLobby) {
-                    WebSocketSession playerWsSession = sessions.get(playerSessionIdInLobby);
-                    if (playerWsSession != null && playerWsSession.isOpen()) {
-                        sendError(playerWsSession, "Host opuścił lobby '" + lobby.getName() + "'. Lobby zostało zamknięte i zostaniesz z niego usunięty.");
-                    }
-                }
-
-                Optional<Lobby> resetLobbyOpt = lobbyService.resetLobbyDueToHostDisconnect(lobby.getId());
-                if (resetLobbyOpt.isPresent()) {
-                    broadcastLobbyUpdate(resetLobbyOpt.get());
-                } else {
-                    broadcastAllNeeded = true;
+            } else {
+                Optional<Lobby> removedOpt = lobbyService.removePlayerFromLobby(lobby.getId(), sessionId);
+                if (removedOpt.isPresent()) {
+                    broadcastLobbyUpdate(removedOpt.get());
                 }
             }
-        }
-
-        for (Lobby lobby : lobbyService.getAllLobbies()) {
-            if (processedLobbies.stream().anyMatch(l -> l.getId().equals(lobby.getId()))) {
-                continue;
-            }
-
-            boolean wasParticipantNonHost = (lobby.getPlayersInTeams().stream().anyMatch(p -> p.sessionId().equals(sessionId)) ||
-                    lobby.getWaitingPlayers().stream().anyMatch(p -> p.sessionId().equals(sessionId)) ||
-                    (lobby.getQuizMaster() != null && lobby.getQuizMaster().sessionId().equals(sessionId)))
-                    && (lobby.getHostSessionId() == null || !lobby.getHostSessionId().equals(sessionId));
-
-            if (wasParticipantNonHost) {
-                System.out.println("WebSocket: Sesja " + sessionId + " była uczestnikiem (nie hostem) w lobby " + lobby.getId() + ". Usuwanie.");
-                Optional<Lobby> updatedLobby = lobbyService.removePlayerFromLobby(lobby.getId(), sessionId);
-                if (updatedLobby.isPresent()) {
-                    broadcastLobbyUpdate(updatedLobby.get());
-                } else {
-                    broadcastAllNeeded = true;
-                }
-            }
-        }
-
-
-        if (broadcastAllNeeded) {
-            System.out.println("WebSocket: Rozgłaszanie aktualizacji wszystkich lobby z powodu rozłączenia lub błędu resetu.");
-            broadcastAllLobbies();
-        }
+        });
     }
 
-
     private void sendError(WebSocketSession session, String errorMessage) {
-        Map<String, Object> errorPayload = Map.of("type", "error", "message", errorMessage);
-        sendMessageToSession(session, errorPayload);
+        if (session.isOpen()) {
+            Map<String, Object> errorPayload = Map.of("type", "error", "message", errorMessage);
+            sendMessageToSession(session, errorPayload);
+        }
     }
 
     public void sendAllLobbiesToOneUser(WebSocketSession session) {
         Collection<Lobby> allLobbies = lobbyService.getAllLobbies();
-
-        List<Map<String, Object>> clientLobbiesView = new ArrayList<>();
-        for (Lobby lobby : allLobbies) {
-            Map<String, Object> lobbyDataForClient = new HashMap<>();
-            lobbyDataForClient.put("id", lobby.getId());
-            lobbyDataForClient.put("name", lobby.getName());
-            lobbyDataForClient.put("status", lobby.getStatus().toString());
-            lobbyDataForClient.put("gameSettings", lobby.getGameSettings());
-            lobbyDataForClient.put("password", lobby.getPassword());
-            lobbyDataForClient.put("hostSessionId", lobby.getHostSessionId());
-            lobbyDataForClient.put("quizMaster", lobby.getQuizMaster());
-            lobbyDataForClient.put("waitingPlayers", lobby.getWaitingPlayers());
-            lobbyDataForClient.put("teams", lobby.getTeams());
-            lobbyDataForClient.put("totalParticipantCount", lobby.getTotalParticipantCount());
-            lobbyDataForClient.put("maxParticipants", lobby.getMaxParticipants());
-            clientLobbiesView.add(lobbyDataForClient);
-        }
+        List<Map<String, Object>> clientLobbiesView = allLobbies.stream()
+                .map(this::mapLobbyToClientData)
+                .collect(Collectors.toList());
         Map<String, Object> messagePayload = Map.of("type", "allLobbies", "lobbies", clientLobbiesView);
         sendMessageToSession(session, messagePayload);
     }
 
-    public void broadcastAllLobbies() {
-        Collection<Lobby> allLobbies = lobbyService.getAllLobbies();
-        List<Map<String, Object>> clientLobbiesView = new ArrayList<>();
-        for (Lobby lobby : allLobbies) {
-            Map<String, Object> lobbyDataForClient = new HashMap<>();
-            lobbyDataForClient.put("id", lobby.getId());
-            lobbyDataForClient.put("name", lobby.getName());
-            lobbyDataForClient.put("status", lobby.getStatus().toString());
-            lobbyDataForClient.put("gameSettings", lobby.getGameSettings());
-            lobbyDataForClient.put("password", lobby.getPassword());
-            lobbyDataForClient.put("hostSessionId", lobby.getHostSessionId());
-            lobbyDataForClient.put("quizMaster", lobby.getQuizMaster());
-            lobbyDataForClient.put("waitingPlayers", lobby.getWaitingPlayers());
-            lobbyDataForClient.put("teams", lobby.getTeams());
-            lobbyDataForClient.put("totalParticipantCount", lobby.getTotalParticipantCount());
-            lobbyDataForClient.put("maxParticipants", lobby.getMaxParticipants());
-            clientLobbiesView.add(lobbyDataForClient);
-        }
-        Map<String, Object> messagePayload = Map.of("type", "allLobbiesUpdate", "lobbies", clientLobbiesView);
-        sessions.values().forEach(s -> sendMessageToSession(s, messagePayload));
-    }
-
     public void broadcastLobbyUpdate(Lobby lobby) {
         if (lobby == null) return;
+        Map<String, Object> lobbyDataForClient = mapLobbyToClientData(lobby);
+        Map<String, Object> messagePayload = Map.of("type", "lobbyUpdate", "lobby", lobbyDataForClient);
+        sessions.values().stream().filter(WebSocketSession::isOpen).forEach(s -> sendMessageToSession(s, messagePayload));
+    }
 
+    private Map<String, Object> mapLobbyToClientData(Lobby lobby) {
         Map<String, Object> lobbyDataForClient = new HashMap<>();
         lobbyDataForClient.put("id", lobby.getId());
         lobbyDataForClient.put("name", lobby.getName());
@@ -341,19 +251,20 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
         lobbyDataForClient.put("teams", lobby.getTeams());
         lobbyDataForClient.put("totalParticipantCount", lobby.getTotalParticipantCount());
         lobbyDataForClient.put("maxParticipants", lobby.getMaxParticipants());
-
-        System.out.println("DEBUG: Wysyłanie lobbyUpdate, dane dla klienta (JSON): " + gson.toJson(lobbyDataForClient));
-
-        Map<String, Object> messagePayload = Map.of("type", "lobbyUpdate", "lobby", lobbyDataForClient);
-
-        System.out.println("WebSocket: Rozgłaszanie aktualizacji lobby '" + lobby.getId() + "' (Status: " + lobby.getStatus() +
-                ", Uczestników: " + lobby.getTotalParticipantCount() + "/" + lobby.getMaxParticipants() +
-                ", Nazwa: " + lobby.getName() +
-                ", Prowadzący: " + (lobby.getQuizMaster() != null ? lobby.getQuizMaster().nickname() : "brak") +
-                ", Oczekujący: " + lobby.getWaitingPlayers().stream().map(PlayerInfo::nickname).collect(Collectors.joining(", ")) +
-                ", Host: " + lobby.getHostSessionId() +
-                ") do " + sessions.size() + " sesji.");
-        sessions.values().forEach(s -> sendMessageToSession(s, messagePayload));
+        lobbyDataForClient.put("currentQuestionText", lobby.getCurrentQuestionText());
+        lobbyDataForClient.put("currentRoundNumber", lobby.getCurrentRoundNumber());
+        lobbyDataForClient.put("totalRounds", lobby.getTotalRounds());
+        lobbyDataForClient.put("currentPlayerSessionId", lobby.getCurrentPlayerSessionId());
+        lobbyDataForClient.put("isTeam1Turn", lobby.isTeam1Turn());
+        lobbyDataForClient.put("team1Score", lobby.getTeam1Score());
+        lobbyDataForClient.put("team2Score", lobby.getTeam2Score());
+        lobbyDataForClient.put("team1Errors", lobby.getTeam1Errors());
+        lobbyDataForClient.put("team2Errors", lobby.getTeam2Errors());
+        lobbyDataForClient.put("revealedAnswersData", lobby.getRevealedAnswersData());
+        lobbyDataForClient.put("currentRoundPoints", lobby.getCurrentRoundPoints());
+        lobbyDataForClient.put("revealedAnswersCountInRound", lobby.getRevealedAnswersCountInRound());
+        lobbyDataForClient.put("currentAnswerTimeRemaining", lobby.getCurrentAnswerTimeRemaining());
+        return lobbyDataForClient;
     }
 
     private void sendMessageToSession(WebSocketSession session, Map<String, Object> payload) {
@@ -361,7 +272,7 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
             try {
                 session.sendMessage(new TextMessage(gson.toJson(payload)));
             } catch (IOException e) {
-                System.err.println("WebSocket: Błąd wysyłania do sesji " + session.getId() + ": " + e.getMessage());
+                System.err.println("Błąd wysyłania wiadomości do sesji " + session.getId() + ": " + e.getMessage());
             }
         }
     }
