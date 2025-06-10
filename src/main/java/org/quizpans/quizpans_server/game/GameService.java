@@ -18,6 +18,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -74,21 +75,25 @@ public class GameService {
         this.currentAnswersList = new ArrayList<>();
         this.answerKeyToCombinedKeywords = new HashMap<>();
         this.synonymToBaseFormMap = new HashMap<>();
-        if (!TextNormalizer.isLemmatizerInitialized() || !SynonymManager.isLoaded() || !org.quizpans.quizpans_server.utils.SpellCheckerService.isInitialized()) {
-            System.err.println("GameService (Server): Krytyczny błąd inicjalizacji narzędzi NLP. Sprawdzanie odpowiedzi może nie działać poprawnie.");
-        }
-        loadQuestion();
     }
 
     public String getCurrentQuestion() {
         return currentQuestion;
     }
 
+    public int getCurrentQuestionId() {
+        return currentQuestionId;
+    }
+
+    public int getTotalAnswersCount() {
+        return currentAnswersList.size();
+    }
+
     public List<AnswerData> getAllAnswersForCurrentQuestion() {
         return Collections.unmodifiableList(currentAnswersList);
     }
 
-    public void loadQuestion() {
+    public boolean loadQuestion(Set<Integer> idsToExclude) {
         currentAnswersList.clear();
         answerKeyToCombinedKeywords.clear();
         synonymToBaseFormMap.clear();
@@ -96,62 +101,109 @@ public class GameService {
         currentQuestionId = -1;
 
         try (Connection conn = DriverManager.getConnection(DatabaseConfig.getUrl(), DatabaseConfig.getUser(), DatabaseConfig.getPassword())) {
-            String sql;
-            PreparedStatement pstmt;
+            boolean questionLoaded = tryLoadQuestion(conn, idsToExclude);
 
-            if (this.category != null && !this.category.trim().isEmpty() && !"MIX (Wszystkie Kategorie)".equalsIgnoreCase(this.category)) {
-                sql = "SELECT id, pytanie, odpowiedz1, punkty1, odpowiedz2, punkty2, odpowiedz3, punkty3, odpowiedz4, punkty4, odpowiedz5, punkty5, odpowiedz6, punkty6 FROM Pytania WHERE kategoria = ? ORDER BY RAND() LIMIT 1";
-                pstmt = conn.prepareStatement(sql);
-                pstmt.setString(1, this.category);
-            } else {
-                sql = "SELECT id, pytanie, odpowiedz1, punkty1, odpowiedz2, punkty2, odpowiedz3, punkty3, odpowiedz4, punkty4, odpowiedz5, punkty5, odpowiedz6, punkty6 FROM Pytania ORDER BY RAND() LIMIT 1";
-                pstmt = conn.prepareStatement(sql);
-            }
-
-            ResultSet rs = pstmt.executeQuery();
-
-            if (rs.next()) {
-                currentQuestionId = rs.getInt("id");
-                currentQuestion = rs.getString("pytanie");
-
-                for (int i = 1; i <= 6; i++) {
-                    String answerText = rs.getString("odpowiedz" + i);
-                    int points = rs.getInt("punkty" + i);
-                    if (answerText != null && !answerText.trim().isEmpty()) {
-                        String originalAnswerTrimmed = answerText.trim();
-                        String baseForm = TextNormalizer.normalizeToBaseForm(originalAnswerTrimmed);
-                        currentAnswersList.add(new AnswerData(originalAnswerTrimmed, points, i - 1, baseForm));
-
-                        List<String> answerTokens = TextNormalizer.getLemmatizedTokens(originalAnswerTrimmed, true);
-                        if (answerTokens.size() >= MIN_WORDS_FOR_KEYWORD_LOGIC) {
-                            answerKeyToCombinedKeywords.computeIfAbsent(baseForm, k -> new HashSet<>()).addAll(answerTokens);
-                        }
-
-                        List<String> rawSynonyms = SynonymManager.findSynonymsFor(originalAnswerTrimmed.toLowerCase());
-                        for (String syn : rawSynonyms) {
-                            String normalizedSyn = TextNormalizer.normalizeToBaseForm(syn);
-                            if (!normalizedSyn.isEmpty() && !normalizedSyn.equals(baseForm) && !currentAnswersList.stream().anyMatch(ad -> ad.baseForm().equals(normalizedSyn))) {
-                                synonymToBaseFormMap.put(normalizedSyn, baseForm);
-                                List<String> synonymTokens = TextNormalizer.getLemmatizedTokens(syn, true);
-                                if (synonymTokens.size() >= MIN_WORDS_FOR_KEYWORD_LOGIC) {
-                                    answerKeyToCombinedKeywords.computeIfAbsent(baseForm, k -> new HashSet<>()).addAll(synonymTokens);
-                                }
-                            }
-                        }
-                    }
+            if (!questionLoaded && idsToExclude != null && !idsToExclude.isEmpty()) {
+                questionLoaded = tryLoadQuestion(conn, Collections.emptySet());
+                if (questionLoaded) {
+                    return true;
                 }
-            } else {
-                currentQuestion = "Błąd: Brak pytań dla tej kategorii.";
             }
-            rs.close();
-            pstmt.close();
+
+            if (!questionLoaded) {
+                currentQuestion = null;
+                currentQuestionId = -1;
+                return false;
+            }
+            return true;
 
         } catch (SQLException e) {
-            System.err.println("GameService (Server): Błąd SQL podczas ładowania pytania: " + e.getMessage());
             currentQuestion = "Błąd serwera przy ładowaniu pytania.";
             throw new RuntimeException("Błąd SQL podczas ładowania pytania.", e);
         }
     }
+
+    private boolean tryLoadQuestion(Connection conn, Set<Integer> idsToExclude) throws SQLException {
+        List<Integer> availableQuestionIds = new ArrayList<>();
+        StringBuilder sqlBuilder = new StringBuilder("SELECT id FROM Pytania");
+        List<Object> params = new ArrayList<>();
+        boolean hasWhere = false;
+
+        if (this.category != null && !this.category.trim().isEmpty() && !"MIX (Wszystkie Kategorie)".equalsIgnoreCase(this.category)) {
+            sqlBuilder.append(" WHERE kategoria = ?");
+            params.add(this.category);
+            hasWhere = true;
+        }
+
+        if (idsToExclude != null && !idsToExclude.isEmpty()) {
+            if (!hasWhere) {
+                sqlBuilder.append(" WHERE");
+            } else {
+                sqlBuilder.append(" AND");
+            }
+            String placeholders = idsToExclude.stream().map(id -> "?").collect(Collectors.joining(","));
+            sqlBuilder.append(" id NOT IN (").append(placeholders).append(")");
+            params.addAll(idsToExclude);
+        }
+
+        try (PreparedStatement pstmt = conn.prepareStatement(sqlBuilder.toString())) {
+            for(int i=0; i < params.size(); i++) {
+                pstmt.setObject(i+1, params.get(i));
+            }
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while(rs.next()) {
+                    availableQuestionIds.add(rs.getInt("id"));
+                }
+            }
+        }
+
+        if (availableQuestionIds.isEmpty()) {
+            return false;
+        }
+
+        int randomId = availableQuestionIds.get(new Random().nextInt(availableQuestionIds.size()));
+
+        String selectSql = "SELECT * FROM Pytania WHERE id = ?";
+        try (PreparedStatement pstmtSelect = conn.prepareStatement(selectSql)) {
+            pstmtSelect.setInt(1, randomId);
+            try (ResultSet rs = pstmtSelect.executeQuery()) {
+                if (rs.next()) {
+                    currentQuestionId = rs.getInt("id");
+                    currentQuestion = rs.getString("pytanie");
+
+                    for (int i = 1; i <= 6; i++) {
+                        String answerText = rs.getString("odpowiedz" + i);
+                        int points = rs.getInt("punkty" + i);
+                        if (answerText != null && !answerText.trim().isEmpty()) {
+                            String originalAnswerTrimmed = answerText.trim();
+                            String baseForm = TextNormalizer.normalizeToBaseForm(originalAnswerTrimmed);
+                            currentAnswersList.add(new AnswerData(originalAnswerTrimmed, points, i - 1, baseForm));
+
+                            List<String> answerTokens = TextNormalizer.getLemmatizedTokens(originalAnswerTrimmed, true);
+                            if (answerTokens.size() >= MIN_WORDS_FOR_KEYWORD_LOGIC) {
+                                answerKeyToCombinedKeywords.computeIfAbsent(baseForm, k -> new HashSet<>()).addAll(answerTokens);
+                            }
+
+                            List<String> rawSynonyms = SynonymManager.findSynonymsFor(originalAnswerTrimmed.toLowerCase());
+                            for (String syn : rawSynonyms) {
+                                String normalizedSyn = TextNormalizer.normalizeToBaseForm(syn);
+                                if (!normalizedSyn.isEmpty() && !normalizedSyn.equals(baseForm) && !currentAnswersList.stream().anyMatch(ad -> ad.baseForm().equals(normalizedSyn))) {
+                                    synonymToBaseFormMap.put(normalizedSyn, baseForm);
+                                    List<String> synonymTokens = TextNormalizer.getLemmatizedTokens(syn, true);
+                                    if (synonymTokens.size() >= MIN_WORDS_FOR_KEYWORD_LOGIC) {
+                                        answerKeyToCombinedKeywords.computeIfAbsent(baseForm, k -> new HashSet<>()).addAll(synonymTokens);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
 
     private static Set<String> getCharacterNGrams(String text, int n) {
         Set<String> nGrams = new HashSet<>();

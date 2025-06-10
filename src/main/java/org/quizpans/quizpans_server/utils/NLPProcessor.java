@@ -14,9 +14,9 @@ public class NLPProcessor {
     private final LemmatizerME lemmatizer;
 
     public NLPProcessor() {
-        try (InputStream modelStream = getClass().getClassLoader().getResourceAsStream("/opennlp-pl-ud-pdb-lemmas-1.2-2.5.0.bin")) {
+        try (InputStream modelStream = NLPProcessor.class.getResourceAsStream("/opennlp-pl-ud-pdb-lemmas-1.2-2.5.0.bin")) {
             if (modelStream == null) {
-                throw new RuntimeException("Nie można znaleźć pliku modelu lematyzatora: opennlp-pl-ud-pdb-lemmas-1.2-2.5.0.bin w classpath");
+                throw new RuntimeException("Nie można znaleźć pliku modelu lematyzatora w classpath: /opennlp-pl-ud-pdb-lemmas-1.2-2.5.0.bin");
             }
             LemmatizerModel model = new LemmatizerModel(modelStream);
             this.lemmatizer = new LemmatizerME(model);

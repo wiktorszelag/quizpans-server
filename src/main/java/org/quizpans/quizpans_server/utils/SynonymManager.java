@@ -24,19 +24,18 @@ public class SynonymManager {
     private static synchronized void loadThesaurus() {
         if (isLoaded) return;
 
-        try (InputStream is = SynonymManager.class.getResourceAsStream(THESAURUS_PATH);
-             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-
-            String line;
-            while ((line = reader.readLine()) != null) {
-                processDictionaryLine(line);
+        try (InputStream is = SynonymManager.class.getResourceAsStream(THESAURUS_PATH)) {
+            if (is == null) {
+                throw new NullPointerException("Nie można znaleźć pliku tezaurusa w classpath: " + THESAURUS_PATH);
             }
-            isLoaded = true;
-        } catch (NullPointerException npe) {
-            System.err.println("SynonymManager (Server): KRYTYCZNY BŁĄD - Nie znaleziono pliku tezaurusa pod ścieżką: " + THESAURUS_PATH);
-            isLoaded = false;
-        }
-        catch (Exception e) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    processDictionaryLine(line);
+                }
+                isLoaded = true;
+            }
+        } catch (Exception e) {
             System.err.println("SynonymManager (Server): Błąd podczas ładowania tezaurusa z " + THESAURUS_PATH + ": " + e.getMessage());
             e.printStackTrace();
             isLoaded = false;
