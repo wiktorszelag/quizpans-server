@@ -1,7 +1,7 @@
 package org.quizpans.quizpans_server.online.model;
 
 import java.util.Objects;
-
+//informacje o graczach prowadzacym przechowuje informacje
 public final class PlayerInfo {
     private final String sessionId;
     private final String nickname;

@@ -1,5 +1,5 @@
 package org.quizpans.quizpans_server.online.service;
-
+// tworzenie lobby cykl gry obsluga lobby obsluga timera
 import org.quizpans.quizpans_server.online.model.Lobby;
 import org.quizpans.quizpans_server.online.model.LobbyStatus;
 import org.quizpans.quizpans_server.online.model.GameSettings;
@@ -28,7 +28,7 @@ import java.util.concurrent.ScheduledExecutorService;
 
 @Service
 public class LobbyService {
-
+    // mapa lobby na serverze
     private final Map<String, Lobby> lobbies = new ConcurrentHashMap<>();
     private static final List<String> LOBBY_IDS = List.of("Red", "Blue", "Green", "Yellow", "Black");
     private final Map<String, GameService> activeGameServices = new ConcurrentHashMap<>();
@@ -38,14 +38,14 @@ public class LobbyService {
         t.setName("LobbyTimerScheduler");
         return t;
     });
-
+    //aktualizacja klient
     private final LobbyWebSocketHandler webSocketHandler;
 
     @Autowired
     public LobbyService(@Lazy LobbyWebSocketHandler webSocketHandler) {
         this.webSocketHandler = webSocketHandler;
     }
-
+    //automatycznie wysyla
     @PostConstruct
     private void initializeLobbies() {
         for (String id : LOBBY_IDS) {
@@ -59,7 +59,7 @@ public class LobbyService {
             lobbies.put(id, newLobby);
         }
     }
-
+    //koniec zamkniecie
     @PreDestroy
     public void shutdownScheduler() {
         if (timerScheduler != null && !timerScheduler.isShutdown()) {
@@ -106,6 +106,46 @@ public class LobbyService {
         }
         return Optional.empty();
     }
+
+    public synchronized Optional<Lobby> hostRevealAnswer(String lobbyId, String hostPanelSessionId, String answerText) {
+        Optional<Lobby> lobbyOpt = getLobby(lobbyId);
+        if (lobbyOpt.isEmpty()) return Optional.empty();
+
+        Lobby lobby = lobbyOpt.get();
+        if (lobby.getHostPanelSessionId() == null || !lobby.getHostPanelSessionId().equals(hostPanelSessionId)) {
+            return Optional.empty();
+        }
+
+        GameService gameService = activeGameServices.get(lobbyId);
+        if (gameService == null) return Optional.empty();
+
+        if (lobby.revealAnswerByHost(answerText, gameService)) {
+            return Optional.of(lobby);
+        }
+
+        return Optional.empty();
+    }
+
+    // NOWA METODA
+    public synchronized Optional<Lobby> revealQuestion(String lobbyId, String hostPanelSessionId) {
+        Optional<Lobby> lobbyOpt = getLobby(lobbyId);
+        if (lobbyOpt.isEmpty()) return Optional.empty();
+
+        Lobby lobby = lobbyOpt.get();
+        if (lobby.getHostPanelSessionId() == null || !lobby.getHostPanelSessionId().equals(hostPanelSessionId)) {
+            return Optional.empty(); // Tylko prowadzący może odkryć pytanie
+        }
+
+        if (lobby.isQuestionRevealed()) {
+            return Optional.of(lobby); // Już odkryte, nic nie rób
+        }
+
+        lobby.setQuestionRevealed(true);
+        lobby.startAnswerTimer(timerScheduler); // Uruchom timer dopiero po odkryciu pytania
+
+        return Optional.of(lobby);
+    }
+
 
     public synchronized Optional<Lobby> registerHostPanel(String lobbyId, String panelSessionId) {
         Optional<Lobby> lobbyOpt = getLobby(lobbyId);
@@ -190,64 +230,72 @@ public class LobbyService {
         return lobbyOpt.get().removePlayer(participantToRemoveSessionId) ? lobbyOpt : Optional.empty();
     }
 
-    public synchronized Optional<Lobby> setLobbyGameStatus(String lobbyId, String hostSessionId, boolean gameInProgress, Set<Integer> usedQuestionIds) {
+    public synchronized Optional<Lobby> prepareLobbyForGame(String lobbyId, String hostSessionId) {
         Optional<Lobby> lobbyOpt = getLobby(lobbyId);
         if (lobbyOpt.isPresent()) {
             Lobby lobby = lobbyOpt.get();
             if (lobby.getHostSessionId() != null && lobby.getHostSessionId().equals(hostSessionId)) {
-                if (gameInProgress) {
-                    GameSettings settings = lobby.getGameSettings();
-                    if (settings == null) return Optional.empty();
+                GameSettings settings = lobby.getGameSettings();
+                if (settings == null) return Optional.empty();
 
-                    Map<String, List<PlayerInfo>> teams = lobby.getTeams();
-                    String teamBlueName = lobby.getTeam1Name();
-                    String teamRedName = lobby.getTeam2Name();
+                Map<String, List<PlayerInfo>> teams = lobby.getTeams();
+                String teamBlueName = lobby.getTeam1Name();
+                String teamRedName = lobby.getTeam2Name();
 
-                    if (!teams.containsKey(teamBlueName) || teams.get(teamBlueName).isEmpty() ||
-                            !teams.containsKey(teamRedName) || teams.get(teamRedName).isEmpty()) {
-                        return Optional.empty();
-                    }
-
-                    String categoryName = settings.category();
-                    final String finalCategoryForService;
-                    if ("MIX (Wszystkie Kategorie)".equalsIgnoreCase(categoryName)) {
-                        finalCategoryForService = null;
-                    } else {
-                        finalCategoryForService = categoryName;
-                    }
-
-                    GameService gameServiceInstance = activeGameServices.computeIfAbsent(lobbyId, k -> new GameService(finalCategoryForService));
-
-                    boolean questionLoaded = gameServiceInstance.loadQuestion(usedQuestionIds);
-
-                    if (!questionLoaded) {
-                        webSocketHandler.sendError(hostSessionId, "NO_QUESTIONS_AVAILABLE");
-                        return Optional.empty();
-                    }
-
-                    lobby.setCurrentQuestionId(gameServiceInstance.getCurrentQuestionId());
-                    loadNewQuestionIntoLobby(lobby, gameServiceInstance);
-
-                    lobby.setCurrentRoundNumber(1);
-                    lobby.setTotalRounds(settings.numberOfRounds());
-                    lobby.setTeam1Score(0); lobby.setTeam2Score(0);
-                    lobby.setTeam1Errors(0); lobby.setTeam2Errors(0);
-                    lobby.setCurrentRoundPoints(0);
-                    lobby.setRevealedAnswersCountInRound(0);
-                    lobby.setTeam1Turn(true);
-                    lobby.setCurrentPlayerSessionId(teams.get(teamBlueName).get(0).sessionId());
-                    lobby.setStatus(LobbyStatus.BUSY);
-                    lobby.startAnswerTimer(timerScheduler);
-                } else {
-                    lobby.stopAnswerTimer();
-                    lobby.resetToAvailable();
-                    activeGameServices.remove(lobbyId);
+                if (!teams.containsKey(teamBlueName) || teams.get(teamBlueName).isEmpty() ||
+                        !teams.containsKey(teamRedName) || teams.get(teamRedName).isEmpty()) {
+                    return Optional.empty();
                 }
+
+                lobby.setCurrentRoundNumber(1);
+                lobby.setTotalRounds(settings.numberOfRounds());
+                lobby.setTeam1Score(0); lobby.setTeam2Score(0);
+                lobby.setTeam1Errors(0); lobby.setTeam2Errors(0);
+                lobby.setCurrentRoundPoints(0);
+                lobby.setRevealedAnswersCountInRound(0);
+                lobby.setTeam1Turn(true);
+                lobby.setCurrentPlayerSessionId(teams.get(teamBlueName).get(0).sessionId());
+                lobby.setStatus(LobbyStatus.BUSY);
+
                 return Optional.of(lobby);
             }
         }
         return Optional.empty();
     }
+
+    public synchronized Optional<Lobby> loadInitialQuestionAndStart(String lobbyId, String hostSessionId, Set<Integer> usedQuestionIds) {
+        Optional<Lobby> lobbyOpt = getLobby(lobbyId);
+        if (lobbyOpt.isEmpty() || !lobbyOpt.get().getHostSessionId().equals(hostSessionId)) {
+            return Optional.empty();
+        }
+
+        Lobby lobby = lobbyOpt.get();
+
+        if (lobby.getCurrentQuestionText() != null) {
+            return Optional.of(lobby);
+        }
+
+        GameSettings settings = lobby.getGameSettings();
+        if (settings == null) return Optional.empty();
+
+        String categoryName = settings.category();
+        final String finalCategoryForService = "MIX (Wszystkie Kategorie)".equalsIgnoreCase(categoryName) ? null : categoryName;
+
+        GameService gameServiceInstance = activeGameServices.computeIfAbsent(lobbyId, k -> new GameService(finalCategoryForService));
+        boolean questionLoaded = gameServiceInstance.loadQuestion(usedQuestionIds);
+
+        if (!questionLoaded) {
+            webSocketHandler.sendError(hostSessionId, "NO_QUESTIONS_AVAILABLE");
+            return Optional.empty();
+        }
+
+        lobby.setCurrentQuestionId(gameServiceInstance.getCurrentQuestionId());
+        loadNewQuestionIntoLobby(lobby, gameServiceInstance);
+        // ZMIANA: Timer startuje dopiero po odkryciu pytania, więc tu nic nie robimy
+
+        return Optional.of(lobby);
+    }
+
 
     public synchronized void loadNewQuestionForNextRound(String lobbyId, String hostSessionId, Set<Integer> usedQuestionIds) {
         Optional<Lobby> lobbyOpt = getLobby(lobbyId);
@@ -275,6 +323,7 @@ public class LobbyService {
 
     private void loadNewQuestionIntoLobby(Lobby lobby, GameService gameServiceInstance) {
         lobby.setCurrentQuestionText(gameServiceInstance.getCurrentQuestion());
+        lobby.setQuestionRevealed(false); // ZMIANA
         lobby.setCurrentQuestionId(gameServiceInstance.getCurrentQuestionId());
         List<Map<String, Object>> initialAnswersData = new ArrayList<>();
         List<GameService.AnswerData> allAnswers = gameServiceInstance.getAllAnswersForCurrentQuestion();
@@ -358,9 +407,7 @@ public class LobbyService {
     }
 
     private void handleRoundOrGameEnd(Lobby lobby, GameService gameServiceInstance) {
-        if (lobby.getStatus() == LobbyStatus.BUSY && lobby.getCurrentQuestionText() == null && lobby.getCurrentRoundNumber() <= lobby.getTotalRounds()) {
-            webSocketHandler.sendError(lobby.getHostSessionId(), "REQUEST_NEW_QUESTION_DATA");
-        } else if (lobby.getStatus() == LobbyStatus.BUSY && lobby.getCurrentPlayerSessionId() != null && lobby.getCurrentQuestionText() != null && !lobby.getCurrentQuestionText().startsWith("Koniec gry!")) {
+        if (lobby.getStatus() == LobbyStatus.BUSY && lobby.isQuestionRevealed() && lobby.getCurrentPlayerSessionId() != null && lobby.getCurrentQuestionText() != null && !lobby.getCurrentQuestionText().startsWith("Koniec gry!")) {
             lobby.startAnswerTimer(timerScheduler);
         } else if (lobby.getCurrentQuestionText() != null && lobby.getCurrentQuestionText().startsWith("Koniec gry!")) {
             lobby.stopAnswerTimer();

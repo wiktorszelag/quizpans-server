@@ -1,5 +1,5 @@
 package org.quizpans.quizpans_server.online.model;
-
+// zarzadzanie lobby graczami stanem gry walka przejecie koniec rundy
 import org.quizpans.quizpans_server.game.GameService;
 
 import java.util.List;
@@ -12,7 +12,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-
+//informacja lobby
 public class Lobby {
     private final String id;
     private String name;
@@ -22,11 +22,12 @@ public class Lobby {
     private String hostSessionId;
     private String hostPanelSessionId;
     private PlayerInfo quizMaster;
-
+    //uczestnicy ilosc
     private final int maxParticipants = 13;
     private final Map<String, PlayerInfo> participants = new ConcurrentHashMap<>();
-
+    //stan gyr
     private String currentQuestionText;
+    private boolean isQuestionRevealed = false;
     private int currentQuestionId = -1;
     private int currentRoundNumber;
     private int totalRounds;
@@ -39,20 +40,19 @@ public class Lobby {
     private List<Map<String, Object>> revealedAnswersData;
     private int currentRoundPoints;
     private int revealedAnswersCountInRound;
-
+    //runda fazy
     private static final int MAX_ERRORS_PER_TEAM_IN_ROUND = 3;
     private boolean stealAttemptInProgress = false;
     private boolean originalTurnTeam1ForSteal;
-
     private boolean initialControlPhaseActive = true;
     private GameService.AnswerProcessingResult firstPlayerAnswerInControlPhase = null;
     private boolean firstTeamAttemptedInControlPhase = false;
-
+    //timer
     private transient ScheduledFuture<?> answerTimerTask;
     private int currentAnswerTimeRemaining;
     private transient Consumer<Lobby> onTimerTickOrTimeoutCallback;
     private transient ScheduledExecutorService timerSchedulerInstance;
-
+    //loby podstawowe wartosci
     public Lobby(String id, String name) {
         this.id = id;
         this.name = name;
@@ -65,7 +65,7 @@ public class Lobby {
     public void setTimerCallback(Consumer<Lobby> callback) {
         this.onTimerTickOrTimeoutCallback = callback;
     }
-
+    //time start
     public synchronized void startAnswerTimer(ScheduledExecutorService scheduler) {
         if (scheduler != null) {
             this.timerSchedulerInstance = scheduler;
@@ -115,7 +115,7 @@ public class Lobby {
             }
         }, 1, 1, TimeUnit.SECONDS);
     }
-
+    //stop
     public synchronized void stopAnswerTimer() {
         if (answerTimerTask != null && !answerTimerTask.isDone()) {
             answerTimerTask.cancel(false);
@@ -194,13 +194,13 @@ public class Lobby {
             }
         }
     }
-
+    //prowadzacy  odpowiedz
     public synchronized void processValidatedAnswer(PlayerInfo answeringPlayer, GameService.AnswerProcessingResult result, GameService gameServiceInstance, boolean isTimeout) {
         if (!isTimeout) stopAnswerTimer();
         this.status = LobbyStatus.BUSY;
         handleGameLogic(answeringPlayer, result, gameServiceInstance);
     }
-
+    //tura gracz
     public synchronized void processAnswer(PlayerInfo answeringPlayer, GameService.AnswerProcessingResult result, GameService gameServiceInstance, boolean isTimeout) {
         if (status != LobbyStatus.BUSY || currentQuestionText == null || currentQuestionText.startsWith("Koniec gry!")) {
             return;
@@ -213,7 +213,29 @@ public class Lobby {
         }
         handleGameLogic(answeringPlayer, result, gameServiceInstance);
     }
+    //odkrycie
+    public synchronized boolean revealAnswerByHost(String answerTextToReveal, GameService gameServiceInstance) {
+        if (revealedAnswersData == null || answerTextToReveal == null) return false;
 
+        for (Map<String, Object> answerMap : revealedAnswersData) {
+            String text = (String) answerMap.get("text");
+            boolean isRevealed = (Boolean) answerMap.get("isRevealed");
+
+            if (!isRevealed && answerTextToReveal.equalsIgnoreCase(text)) {
+                answerMap.put("isRevealed", true);
+                this.currentRoundPoints += (Integer) answerMap.get("points");
+                this.revealedAnswersCountInRound++;
+
+                if (gameServiceInstance != null && revealedAnswersCountInRound >= gameServiceInstance.getTotalAnswersCount()) {
+                    if (isTeam1Turn) team1Score += currentRoundPoints; else team2Score += currentRoundPoints;
+                    finalizeRound(gameServiceInstance, false);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+    //gra gameplay
     private void gainControlAndContinue(GameService gameServiceInstance) {
         initialControlPhaseActive = false;
         firstPlayerAnswerInControlPhase = null;
@@ -274,10 +296,10 @@ public class Lobby {
 
     public void finalizeRound(GameService gameServiceInstance, boolean stealJustResolved) {
         stopAnswerTimer();
-        stealAttemptInProgress = false;
         initialControlPhaseActive = true;
         firstPlayerAnswerInControlPhase = null;
         firstTeamAttemptedInControlPhase = false;
+        isQuestionRevealed = false;
 
         if (currentRoundNumber >= totalRounds) {
             this.currentQuestionText = "Koniec gry! Wynik " + getTeam1Name() + ": " + team1Score + ", " + getTeam2Name() + ": " + team2Score;
@@ -296,11 +318,12 @@ public class Lobby {
             isTeam1Turn = !isTeam1Turn;
 
             this.currentQuestionText = null;
-            this.revealedAnswersData.clear();
 
             List<PlayerInfo> startingTeamPlayers = getCurrentTeamPlayers();
             if (startingTeamPlayers != null && !startingTeamPlayers.isEmpty()) {
-                this.currentPlayerSessionId = startingTeamPlayers.get(0).sessionId();
+                // ZMIANA LOGIKI WYBORU GRACZA
+                int nextPlayerIndex = (currentRoundNumber - 1) % startingTeamPlayers.size();
+                this.currentPlayerSessionId = startingTeamPlayers.get(nextPlayerIndex).sessionId();
             } else {
                 this.currentPlayerSessionId = null;
             }
@@ -439,7 +462,7 @@ public class Lobby {
                 .filter(p -> p.getRole() == ParticipantRole.PLAYER && p.teamName() != null)
                 .collect(Collectors.groupingBy(PlayerInfo::teamName));
     }
-
+    //gracze druzyny
     public synchronized boolean addPlayer(PlayerInfo player) {
         if (player == null || player.sessionId() == null) return false;
         if (participants.containsKey(player.sessionId())) return false;
@@ -505,7 +528,7 @@ public class Lobby {
     public PlayerInfo findParticipantBySessionId(String sessionId) {
         return participants.get(sessionId);
     }
-
+    //reset pol stan wartosci
     public synchronized void resetToAvailable() {
         stopAnswerTimer();
         this.status = LobbyStatus.AVAILABLE;
@@ -516,6 +539,7 @@ public class Lobby {
         this.quizMaster = null;
         this.participants.clear();
         this.currentQuestionText = null;
+        this.isQuestionRevealed = false;
         this.currentQuestionId = -1;
         this.currentRoundNumber = 0;
         this.totalRounds = 0;
@@ -535,9 +559,11 @@ public class Lobby {
         this.firstPlayerAnswerInControlPhase = null;
         this.firstTeamAttemptedInControlPhase = false;
     }
-
+    //pomoc dla innych klas odczyt modyfikacj
     public String getCurrentQuestionText() { return currentQuestionText; }
     public void setCurrentQuestionText(String currentQuestionText) { this.currentQuestionText = currentQuestionText; }
+    public boolean isQuestionRevealed() { return isQuestionRevealed; }
+    public void setQuestionRevealed(boolean questionRevealed) { isQuestionRevealed = questionRevealed; }
     public int getCurrentQuestionId() { return currentQuestionId; }
     public void setCurrentQuestionId(int id) { this.currentQuestionId = id; }
     public int getCurrentRoundNumber() { return currentRoundNumber; }

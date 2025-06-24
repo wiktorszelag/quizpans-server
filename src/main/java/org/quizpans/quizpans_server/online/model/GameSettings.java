@@ -1,5 +1,5 @@
 package org.quizpans.quizpans_server.online.model;
-
+//ustawienia gry
 public record GameSettings(
         String category,
         int answerTime,

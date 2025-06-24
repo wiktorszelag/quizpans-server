@@ -21,39 +21,41 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.stream.Collectors;
-
+//zarzadzanie stanem gry
+// ladowanie pytan z DatabesConfig
+// ocena odpowiedzi
 public class GameService {
-
+        //przechowanie odpowiedzi
     private String currentQuestion;
     private int currentQuestionId = -1;
     private List<AnswerData> currentAnswersList;
     private final String category;
     private Map<String, Set<String>> answerKeyToCombinedKeywords;
     private Map<String, String> synonymToBaseFormMap;
-
+            //mapy do slow
     private static final int N_GRAM_SIZE = 3;
     private static final int MIN_WORDS_FOR_KEYWORD_LOGIC = 2;
     private static final double MIN_KEYWORD_QUALITY_THRESHOLD = 0.35;
-
+            //wagi do algo
     private static final double WEIGHT_LEVENSHTEIN_SIMILARITY = 0.25;
     private static final double WEIGHT_JARO_WINKLER = 0.15;
     private static final double WEIGHT_JACCARD_TOKEN_SET = 0.25;
     private static final double WEIGHT_KEYWORD_SCORE = 0.35;
-
+            //progi
     private static final double MIN_ACCEPTABLE_COMBINED_SCORE = 0.58;
     private static final double MIN_ACCEPTABLE_PHRASE_SCORE = 0.60;
     private static final double FALLBACK_SINGLE_WORD_JARO_WINKLER_THRESHOLD = 0.85;
     private static final double STRONG_PARTIAL_KEYWORD_CONFIDENCE = 0.75;
     private static final double MIN_COVERAGE_FOR_STRONG_PARTIAL = 0.40;
 
-
+        //odpowiedz teskt punkty indeks +forma pordsawowa
     public static record AnswerData(String originalText, int points, int displayOrderIndex, String baseForm) {
         public String getOriginalText() { return originalText; }
         public int getPoints() { return points; }
         public int getDisplayOrderIndex() { return displayOrderIndex; }
         public String getBaseForm() { return baseForm; }
     }
-
+        //gracz odpowiedzi punkty
     public static class AnswerProcessingResult {
         public final boolean isCorrect;
         public final int pointsAwarded;
@@ -69,14 +71,14 @@ public class GameService {
             this.baseFormMatched = baseFormMatched;
         }
     }
-
+                //kateogira gry przechowywanie
     public GameService(String category) {
         this.category = category;
         this.currentAnswersList = new ArrayList<>();
         this.answerKeyToCombinedKeywords = new HashMap<>();
         this.synonymToBaseFormMap = new HashMap<>();
     }
-
+            //stan gry
     public String getCurrentQuestion() {
         return currentQuestion;
     }
@@ -92,14 +94,14 @@ public class GameService {
     public List<AnswerData> getAllAnswersForCurrentQuestion() {
         return Collections.unmodifiableList(currentAnswersList);
     }
-
+//reste
     public boolean loadQuestion(Set<Integer> idsToExclude) {
         currentAnswersList.clear();
         answerKeyToCombinedKeywords.clear();
         synonymToBaseFormMap.clear();
         currentQuestion = null;
         currentQuestionId = -1;
-
+//pytanie bez questions
         try (Connection conn = DriverManager.getConnection(DatabaseConfig.getUrl(), DatabaseConfig.getUser(), DatabaseConfig.getPassword())) {
             boolean questionLoaded = tryLoadQuestion(conn, idsToExclude);
 
@@ -122,7 +124,7 @@ public class GameService {
             throw new RuntimeException("Błąd SQL podczas ładowania pytania.", e);
         }
     }
-
+            // losowe pytanie + pelne dane
     private boolean tryLoadQuestion(Connection conn, Set<Integer> idsToExclude) throws SQLException {
         List<Integer> availableQuestionIds = new ArrayList<>();
         StringBuilder sqlBuilder = new StringBuilder("SELECT id FROM Pytania");
@@ -170,7 +172,7 @@ public class GameService {
                 if (rs.next()) {
                     currentQuestionId = rs.getInt("id");
                     currentQuestion = rs.getString("pytanie");
-
+// przetwarzanie kolejnych pytan
                     for (int i = 1; i <= 6; i++) {
                         String answerText = rs.getString("odpowiedz" + i);
                         int points = rs.getInt("punkty" + i);
@@ -204,7 +206,7 @@ public class GameService {
         return false;
     }
 
-
+  //analiza odpowiedzi
     private static Set<String> getCharacterNGrams(String text, int n) {
         Set<String> nGrams = new HashSet<>();
         if (text == null || text.length() < n) return nGrams;
@@ -224,7 +226,7 @@ public class GameService {
         if (union.isEmpty()) return 1.0;
         return (double) intersection.size() / union.size();
     }
-
+    //metoda Levenshteina
     private int calculateAdaptiveLevenshteinThreshold(int correctAnswerLength) {
         if (correctAnswerLength <= 1) return 0;
         if (correctAnswerLength <= 3) return 1;
@@ -233,7 +235,7 @@ public class GameService {
         if (correctAnswerLength <= 10) return 3;
         return Math.min(4, (int) Math.ceil(correctAnswerLength * 0.30));
     }
-
+// przetwarzanie odpowiedzi
     public AnswerProcessingResult processPlayerAnswer(String userAnswerText) {
         if (userAnswerText == null || userAnswerText.trim().isEmpty()) {
             return new AnswerProcessingResult(false, 0, null, -1, null);
@@ -247,7 +249,7 @@ public class GameService {
                 return new AnswerProcessingResult(true, correctAnswerData.points(), correctAnswerData.originalText(), correctAnswerData.displayOrderIndex(), correctAnswerData.baseForm());
             }
         }
-
+        //synonimy
         String mappedSynonymBaseForm = synonymToBaseFormMap.get(normalizedUserAnswer);
         if (mappedSynonymBaseForm != null) {
             Optional<AnswerData> synonymTargetAnswer = currentAnswersList.stream()
@@ -258,7 +260,7 @@ public class GameService {
             }
         }
 
-
+//fuzy dopaoswywanie
         String bestFuzzyMatchKey = null;
         double highestOverallConfidence = 0.0;
         AnswerData bestMatchData = null;
@@ -275,7 +277,7 @@ public class GameService {
 
             double keywordScoreContribution = 0.0;
             boolean strongPartialKeywordMatch = false;
-
+//oblicznie wyniku
             Set<String> expectedKeywords = answerKeyToCombinedKeywords.get(correctBaseForm);
             if (expectedKeywords != null && !expectedKeywords.isEmpty() && !userTokens.isEmpty()) {
                 Set<String> userKeywordSet = new HashSet<>(userTokens);
@@ -340,6 +342,7 @@ public class GameService {
                 }
             }
         }
+        //blad
         return new AnswerProcessingResult(false, 0, null, -1, null);
     }
 }

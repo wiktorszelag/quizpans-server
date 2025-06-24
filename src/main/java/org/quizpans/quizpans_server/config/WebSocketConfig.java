@@ -1,5 +1,9 @@
 package org.quizpans.quizpans_server.config;
 
+
+// Aktywacja obsługi WebSocket
+// obsluga wiadomosci
+// rozmiar wiadomosci
 import org.quizpans.quizpans_server.online.websocket.LobbyWebSocketHandler;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -23,13 +27,13 @@ public class WebSocketConfig implements WebSocketConfigurer {
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(lobbyWebSocketHandler, "/lobby") // Endpoint dla lobby
-                .setAllowedOrigins("*"); // Na razie zezwalamy na wszystkie źródła, w produkcji warto to ograniczyć
+                .setAllowedOrigins("*"); // zezwolenie na wszystkei zrodla
     }
 
     @Bean
     public ServletServerContainerFactoryBean createWebSocketContainer() {
         ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean();
-        container.setMaxTextMessageBufferSize(1024000); // 1MB, np. dla większych wiadomości JSON
+        container.setMaxTextMessageBufferSize(1024000); // 1MB
         container.setMaxBinaryMessageBufferSize(1024000);
         return container;
     }

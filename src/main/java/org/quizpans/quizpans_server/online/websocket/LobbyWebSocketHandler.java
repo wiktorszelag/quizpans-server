@@ -1,5 +1,8 @@
 package org.quizpans.quizpans_server.online.websocket;
-
+// zarzadzanie polaczeniami
+// przetwarzanie wiadomosci od klientow
+// rozglos do wszsytkich
+//format danych na json
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonSyntaxException;
@@ -19,7 +22,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 import java.io.IOException;
 import java.lang.reflect.Type;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -29,7 +31,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
-
+//polacznie miedzy strona a aplikacja
 @Component
 public class LobbyWebSocketHandler extends TextWebSocketHandler {
 
@@ -41,7 +43,7 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
     public LobbyWebSocketHandler(LobbyService lobbyService) {
         this.lobbyService = lobbyService;
     }
-
+    //automatyzacja po polaczeniu
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         sessions.put(session.getId(), session);
@@ -51,7 +53,7 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
         sendMessageToSession(session, sessionIdMessage);
         sendAllLobbiesToOneUser(session);
     }
-
+    //obsluga wiadomosci
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         String payload = message.getPayload();
@@ -179,6 +181,13 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
                     break;
                 case "startGame":
                     lobbyId = (String) messageData.get("lobbyId");
+                    if (lobbyId != null) {
+                        updatedLobbyOpt = lobbyService.prepareLobbyForGame(lobbyId, session.getId());
+                        updatedLobbyOpt.ifPresent(this::broadcastLobbyUpdate);
+                    } else { sendError(session.getId(), "Brak lobbyId w żądaniu startGame."); }
+                    break;
+                case "requestInitialQuestion":
+                    lobbyId = (String) messageData.get("lobbyId");
                     Set<Integer> usedQuestionIds = new HashSet<>();
                     if (messageData.containsKey("usedQuestionIds")) {
                         List<Double> idsAsDouble = (List<Double>) messageData.get("usedQuestionIds");
@@ -187,9 +196,9 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
                         }
                     }
                     if (lobbyId != null) {
-                        updatedLobbyOpt = lobbyService.setLobbyGameStatus(lobbyId, session.getId(), true, usedQuestionIds);
+                        updatedLobbyOpt = lobbyService.loadInitialQuestionAndStart(lobbyId, session.getId(), usedQuestionIds);
                         updatedLobbyOpt.ifPresent(this::broadcastLobbyUpdate);
-                    } else { sendError(session.getId(), "Brak lobbyId w żądaniu startGame."); }
+                    } else { sendError(session.getId(), "Brak lobbyId w żądaniu requestInitialQuestion."); }
                     break;
                 case "requestNewQuestion":
                     lobbyId = (String) messageData.get("lobbyId");
@@ -232,6 +241,26 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
                         } else {
                             sendError(session.getId(), "Nie jesteś uprawniony do walidacji odpowiedzi w tym lobby.");
                         }
+                    }
+                    break;
+                case "revealAnswerByHost":
+                    lobbyId = (String) messageData.get("lobbyId");
+                    String answerText = (String) messageData.get("answerText");
+                    if (lobbyId != null && answerText != null) {
+                        updatedLobbyOpt = lobbyService.hostRevealAnswer(lobbyId, session.getId(), answerText);
+                        updatedLobbyOpt.ifPresent(this::broadcastLobbyUpdate);
+                    } else {
+                        sendError(session.getId(), "Brakujące dane w żądaniu revealAnswerByHost.");
+                    }
+                    break;
+                // NOWA AKCJA
+                case "revealQuestion":
+                    lobbyId = (String) messageData.get("lobbyId");
+                    if (lobbyId != null) {
+                        updatedLobbyOpt = lobbyService.revealQuestion(lobbyId, session.getId());
+                        updatedLobbyOpt.ifPresent(this::broadcastLobbyUpdate);
+                    } else {
+                        sendError(session.getId(), "Brak lobbyId w żądaniu revealQuestion.");
                     }
                     break;
                 default: sendError(session.getId(), "Nieznana akcja: " + action);
@@ -290,7 +319,7 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
     public void sendAllLobbiesToOneUser(WebSocketSession session) {
         Collection<Lobby> allLobbies = lobbyService.getAllLobbies();
         List<Map<String, Object>> clientLobbiesView = allLobbies.stream()
-                .map(this::mapLobbyToClientData)
+                .map(lobby -> mapLobbyToClientData(lobby, session)) // Przekazujemy sesję
                 .collect(Collectors.toList());
         Map<String, Object> messagePayload = Map.of("type", "allLobbies", "lobbies", clientLobbiesView);
         sendMessageToSession(session, messagePayload);
@@ -298,12 +327,14 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
 
     public void broadcastLobbyUpdate(Lobby lobby) {
         if (lobby == null) return;
-        Map<String, Object> lobbyDataForClient = mapLobbyToClientData(lobby);
-        Map<String, Object> messagePayload = Map.of("type", "lobbyUpdate", "lobby", lobbyDataForClient);
-        sessions.values().stream().filter(WebSocketSession::isOpen).forEach(s -> sendMessageToSession(s, messagePayload));
+        sessions.values().stream().filter(WebSocketSession::isOpen).forEach(s -> {
+            Map<String, Object> lobbyDataForClient = mapLobbyToClientData(lobby, s); // Przekazujemy sesję
+            Map<String, Object> messagePayload = Map.of("type", "lobbyUpdate", "lobby", lobbyDataForClient);
+            sendMessageToSession(s, messagePayload);
+        });
     }
 
-    private Map<String, Object> mapLobbyToClientData(Lobby lobby) {
+    private Map<String, Object> mapLobbyToClientData(Lobby lobby, WebSocketSession session) {
         Map<String, Object> lobbyDataForClient = new HashMap<>();
         lobbyDataForClient.put("id", lobby.getId());
         lobbyDataForClient.put("name", lobby.getName());
@@ -316,7 +347,19 @@ public class LobbyWebSocketHandler extends TextWebSocketHandler {
         lobbyDataForClient.put("teams", lobby.getTeams());
         lobbyDataForClient.put("totalParticipantCount", lobby.getTotalParticipantCount());
         lobbyDataForClient.put("maxParticipants", lobby.getMaxParticipants());
-        lobbyDataForClient.put("currentQuestionText", lobby.getCurrentQuestionText());
+
+        // NOWA LOGIKA: Warunkowe wysyłanie pytania
+        String hostPanelSessionId = lobby.getHostPanelSessionId();
+        boolean isRecipientQuizMaster = hostPanelSessionId != null && hostPanelSessionId.equals(session.getId());
+
+        if (!isRecipientQuizMaster && lobby.getCurrentQuestionText() != null && !lobby.isQuestionRevealed()) {
+            lobbyDataForClient.put("currentQuestionText", "Prowadzący przygotowuje pytanie...");
+        } else {
+            lobbyDataForClient.put("currentQuestionText", lobby.getCurrentQuestionText());
+        }
+        lobbyDataForClient.put("isQuestionRevealed", lobby.isQuestionRevealed()); // Wysyłamy nową flagę
+
+
         lobbyDataForClient.put("currentQuestionId", lobby.getCurrentQuestionId());
         lobbyDataForClient.put("currentRoundNumber", lobby.getCurrentRoundNumber());
         lobbyDataForClient.put("totalRounds", lobby.getTotalRounds());
